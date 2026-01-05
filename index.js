@@ -62,15 +62,39 @@ async function callMeevoAPI(endpoint, method = 'GET', data = null) {
 async function findClientByPhone(phone, locationId) {
   const normalizedPhone = phone.replace(/\D/g, '').slice(-10);
 
-  const result = await callMeevoAPI(
-    `/clients?TenantId=${CONFIG.TENANT_ID}&LocationId=${locationId}`
-  );
+  // Parallel pagination search
+  const PAGES_PER_BATCH = 10;
+  const ITEMS_PER_PAGE = 100;
+  const MAX_BATCHES = 20;
 
-  if (result.success && result.data?.data) {
-    return result.data.data.find(c => {
-      const clientPhone = (c.primaryPhoneNumber || '').replace(/\D/g, '').slice(-10);
-      return clientPhone === normalizedPhone;
-    });
+  for (let batch = 0; batch < MAX_BATCHES; batch++) {
+    const startPage = batch * PAGES_PER_BATCH + 1;
+    const pagePromises = [];
+
+    for (let i = 0; i < PAGES_PER_BATCH; i++) {
+      const page = startPage + i;
+      pagePromises.push(
+        callMeevoAPI(`/clients?tenantid=${CONFIG.TENANT_ID}&locationid=${locationId}&PageNumber=${page}&ItemsPerPage=${ITEMS_PER_PAGE}`)
+          .catch(() => ({ success: false, data: { data: [] } }))
+      );
+    }
+
+    const results = await Promise.all(pagePromises);
+    let emptyPages = 0;
+
+    for (const result of results) {
+      const clients = result.success ? (result.data?.data || []) : [];
+      if (clients.length === 0) emptyPages++;
+
+      for (const c of clients) {
+        const clientPhone = (c.primaryPhoneNumber || '').replace(/\D/g, '').slice(-10);
+        if (clientPhone === normalizedPhone) {
+          return c;
+        }
+      }
+    }
+
+    if (emptyPages === PAGES_PER_BATCH) break;
   }
   return null;
 }
@@ -88,80 +112,67 @@ async function findLinkedProfiles(guardianId, guardianLastName, locationId) {
 
   console.log(`PRODUCTION: Finding linked profiles for guardian: ${guardianId}`);
 
-  // Try CDC endpoint for recent changes
-  try {
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - 6);
-    const startDateStr = startDate.toISOString();
+  // Search ALL clients with pagination and check guardianId for each
+  // This is more thorough than just checking same last name
+  const PAGES_PER_BATCH = 10;
+  const ITEMS_PER_PAGE = 100;
+  const MAX_BATCHES = 10;  // Search up to 10,000 clients
 
-    const cdcResult = await callMeevoAPI(
-      `/cdc/entity/Client/changes?TenantId=${CONFIG.TENANT_ID}&LocationId=${locationId}&StartDate=${startDateStr}&ItemsPerPage=200`
-    );
+  for (let batch = 0; batch < MAX_BATCHES; batch++) {
+    const startPage = batch * PAGES_PER_BATCH + 1;
+    const pagePromises = [];
 
-    if (cdcResult.success && cdcResult.data?.data) {
-      for (const record of cdcResult.data.data) {
-        const client = record.Client_T;
-        if (!client) continue;
+    for (let i = 0; i < PAGES_PER_BATCH; i++) {
+      const page = startPage + i;
+      pagePromises.push(
+        callMeevoAPI(`/clients?tenantid=${CONFIG.TENANT_ID}&locationid=${locationId}&PageNumber=${page}&ItemsPerPage=${ITEMS_PER_PAGE}`)
+          .catch(() => ({ success: false, data: { data: [] } }))
+      );
+    }
 
-        if (client.GuardianId === guardianId && !seenIds.has(client.EntityId)) {
-          seenIds.add(client.EntityId);
-          linkedProfiles.push({
-            client_id: client.EntityId,
-            first_name: client.FirstName,
-            last_name: client.LastName,
-            name: `${client.FirstName} ${client.LastName}`,
-            is_minor: client.IsMinor || false,
-            type: client.IsMinor ? 'minor' : 'guest'
-          });
+    const results = await Promise.all(pagePromises);
+    let emptyPages = 0;
+
+    // Collect all potential linked profiles (minors or same last name)
+    const potentials = [];
+    for (const result of results) {
+      const clients = result.success ? (result.data?.data || []) : [];
+      if (clients.length === 0) emptyPages++;
+
+      for (const c of clients) {
+        if (c.clientId !== guardianId && !seenIds.has(c.clientId)) {
+          // Check minors or same last name as potential linked profiles
+          potentials.push(c);
         }
       }
     }
-  } catch (e) {
-    console.log(`PRODUCTION: CDC error: ${e.message}`);
-  }
 
-  // Check /clients list for same last name
-  let pageNumber = 1;
-  const maxPages = 10;
+    // Check each potential's guardianId (in parallel batches of 10)
+    for (let i = 0; i < potentials.length; i += 10) {
+      const batch = potentials.slice(i, i + 10);
+      const detailPromises = batch.map(c =>
+        getClientDetails(c.clientId, locationId).catch(() => null)
+      );
+      const details = await Promise.all(detailPromises);
 
-  while (pageNumber <= maxPages) {
-    const clientsResult = await callMeevoAPI(
-      `/clients?TenantId=${CONFIG.TENANT_ID}&LocationId=${locationId}&ItemsPerPage=200&PageNumber=${pageNumber}`
-    );
-
-    if (!clientsResult.success || !clientsResult.data?.data || clientsResult.data.data.length === 0) {
-      break;
-    }
-
-    const clients = clientsResult.data.data;
-    const potentials = clients.filter(c =>
-      c.clientId !== guardianId &&
-      !seenIds.has(c.clientId) &&
-      c.lastName?.toLowerCase() === guardianLastName?.toLowerCase()
-    );
-
-    for (const potential of potentials) {
-      try {
-        const detail = await getClientDetails(potential.clientId, locationId);
-
+      for (let j = 0; j < batch.length; j++) {
+        const c = batch[j];
+        const detail = details[j];
         if (detail?.guardianId === guardianId) {
-          seenIds.add(potential.clientId);
+          seenIds.add(c.clientId);
           linkedProfiles.push({
-            client_id: potential.clientId,
-            first_name: potential.firstName,
-            last_name: potential.lastName,
-            name: `${potential.firstName} ${potential.lastName}`,
+            client_id: c.clientId,
+            first_name: c.firstName,
+            last_name: c.lastName,
+            name: `${c.firstName} ${c.lastName}`,
             is_minor: detail.isMinor || false,
             type: detail.isMinor ? 'minor' : 'guest'
           });
         }
-      } catch (e) {
-        // Skip on error
       }
     }
 
-    if (clients.length < 200) break;
-    pageNumber++;
+    if (emptyPages === PAGES_PER_BATCH) break;
   }
 
   return linkedProfiles;
