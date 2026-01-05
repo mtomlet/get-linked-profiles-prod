@@ -112,69 +112,56 @@ async function findLinkedProfiles(guardianId, guardianLastName, locationId) {
 
   console.log(`PRODUCTION: Finding linked profiles for guardian: ${guardianId}`);
 
-  // Search ALL clients with pagination and check guardianId for each
-  // This is more thorough than just checking same last name
-  const PAGES_PER_BATCH = 10;
-  const ITEMS_PER_PAGE = 100;
-  const MAX_BATCHES = 10;  // Search up to 10,000 clients
+  // Use CDC endpoint - it returns GuardianId directly (no need for individual detail calls)
+  // CDC is FAST because it includes all client fields in the response
+  const authToken = await getToken();
 
-  for (let batch = 0; batch < MAX_BATCHES; batch++) {
-    const startPage = batch * PAGES_PER_BATCH + 1;
-    const pagePromises = [];
+  // Start from beginning of current year to catch all recent linked profiles
+  const currentYear = new Date().getFullYear();
+  const startDate = `${currentYear}-01-01T00:00:00.000Z`;
 
-    for (let i = 0; i < PAGES_PER_BATCH; i++) {
-      const page = startPage + i;
-      pagePromises.push(
-        callMeevoAPI(`/clients?tenantid=${CONFIG.TENANT_ID}&locationid=${locationId}&PageNumber=${page}&ItemsPerPage=${ITEMS_PER_PAGE}`)
-          .catch(() => ({ success: false, data: { data: [] } }))
+  console.log(`PRODUCTION: Searching CDC from ${startDate}`);
+
+  let page = 1;
+  const maxPages = 50;  // Safety limit
+
+  while (page <= maxPages) {
+    try {
+      const cdcRes = await axios.get(
+        `${CONFIG.API_URL}/cdc/entity/Client/changes?tenantid=${CONFIG.TENANT_ID}&locationid=${locationId}&StartDate=${startDate}&PageNumber=${page}&ItemsPerPage=100`,
+        { headers: { Authorization: `Bearer ${authToken}` }, timeout: 10000 }
       );
-    }
 
-    const results = await Promise.all(pagePromises);
-    let emptyPages = 0;
+      const records = cdcRes.data?.data || [];
+      if (records.length === 0) break;
 
-    // Collect all potential linked profiles (minors or same last name)
-    const potentials = [];
-    for (const result of results) {
-      const clients = result.success ? (result.data?.data || []) : [];
-      if (clients.length === 0) emptyPages++;
+      for (const record of records) {
+        const client = record.Client_T;
+        if (!client) continue;
 
-      for (const c of clients) {
-        if (c.clientId !== guardianId && !seenIds.has(c.clientId)) {
-          // Check minors or same last name as potential linked profiles
-          potentials.push(c);
-        }
-      }
-    }
-
-    // Check each potential's guardianId (in parallel batches of 10)
-    for (let i = 0; i < potentials.length; i += 10) {
-      const batch = potentials.slice(i, i + 10);
-      const detailPromises = batch.map(c =>
-        getClientDetails(c.clientId, locationId).catch(() => null)
-      );
-      const details = await Promise.all(detailPromises);
-
-      for (let j = 0; j < batch.length; j++) {
-        const c = batch[j];
-        const detail = details[j];
-        if (detail?.guardianId === guardianId) {
-          seenIds.add(c.clientId);
+        // Check if this client has our guardian as their guardian
+        if (client.GuardianId === guardianId && !seenIds.has(client.EntityId)) {
+          seenIds.add(client.EntityId);
           linkedProfiles.push({
-            client_id: c.clientId,
-            first_name: c.firstName,
-            last_name: c.lastName,
-            name: `${c.firstName} ${c.lastName}`,
-            is_minor: detail.isMinor || false,
-            type: detail.isMinor ? 'minor' : 'guest'
+            client_id: client.EntityId,
+            first_name: client.FirstName,
+            last_name: client.LastName,
+            name: `${client.FirstName} ${client.LastName}`,
+            is_minor: client.IsMinor || false,
+            type: client.IsMinor ? 'minor' : 'guest'
           });
+          console.log(`PRODUCTION: Found linked profile via CDC: ${client.FirstName} ${client.LastName}`);
         }
       }
-    }
 
-    if (emptyPages === PAGES_PER_BATCH) break;
+      page++;
+    } catch (e) {
+      console.log(`PRODUCTION: CDC error on page ${page}: ${e.message}`);
+      break;
+    }
   }
 
+  console.log(`PRODUCTION: CDC search complete. Found ${linkedProfiles.length} linked profiles.`);
   return linkedProfiles;
 }
 
