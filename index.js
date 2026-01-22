@@ -6,6 +6,9 @@
  *
  * PRODUCTION CREDENTIALS - DO NOT USE FOR TESTING
  * Location: Keep It Cut - Phoenix Encanto (201664)
+ *
+ * FAST SEARCH: Start from most recent clients (page 150+) where new linked profiles are
+ * Only check clients without phone numbers (likely minors/dependents)
  */
 
 const express = require('express');
@@ -40,29 +43,10 @@ async function getToken() {
   return token;
 }
 
-async function callMeevoAPI(endpoint, method = 'GET', data = null) {
-  const authToken = await getToken();
-
-  try {
-    const config = {
-      method,
-      url: `${CONFIG.API_URL}${endpoint}`,
-      headers: { Authorization: `Bearer ${authToken}` }
-    };
-    if (data && method !== 'GET') config.data = data;
-    return { success: true, data: (await axios(config)).data };
-  } catch (error) {
-    return {
-      success: false,
-      error: error.response?.data?.error?.message || error.message
-    };
-  }
-}
-
 async function findClientByPhone(phone, locationId) {
+  const authToken = await getToken();
   const normalizedPhone = phone.replace(/\D/g, '').slice(-10);
 
-  // Parallel pagination search
   const PAGES_PER_BATCH = 10;
   const ITEMS_PER_PAGE = 100;
   const MAX_BATCHES = 20;
@@ -74,8 +58,10 @@ async function findClientByPhone(phone, locationId) {
     for (let i = 0; i < PAGES_PER_BATCH; i++) {
       const page = startPage + i;
       pagePromises.push(
-        callMeevoAPI(`/clients?tenantid=${CONFIG.TENANT_ID}&locationid=${locationId}&PageNumber=${page}&ItemsPerPage=${ITEMS_PER_PAGE}`)
-          .catch(() => ({ success: false, data: { data: [] } }))
+        axios.get(
+          `${CONFIG.API_URL}/clients?tenantid=${CONFIG.TENANT_ID}&locationid=${locationId}&PageNumber=${page}&ItemsPerPage=${ITEMS_PER_PAGE}`,
+          { headers: { Authorization: `Bearer ${authToken}` }, timeout: 3000 }
+        ).catch(() => ({ data: { data: [] } }))
       );
     }
 
@@ -83,7 +69,7 @@ async function findClientByPhone(phone, locationId) {
     let emptyPages = 0;
 
     for (const result of results) {
-      const clients = result.success ? (result.data?.data || []) : [];
+      const clients = result.data?.data || [];
       if (clients.length === 0) emptyPages++;
 
       for (const c of clients) {
@@ -100,68 +86,120 @@ async function findClientByPhone(phone, locationId) {
 }
 
 async function getClientDetails(clientId, locationId) {
-  const result = await callMeevoAPI(
-    `/client/${clientId}?TenantId=${CONFIG.TENANT_ID}&LocationId=${locationId}`
-  );
-  return result.success ? (result.data?.data || result.data) : null;
+  const authToken = await getToken();
+  try {
+    const res = await axios.get(
+      `${CONFIG.API_URL}/client/${clientId}?TenantId=${CONFIG.TENANT_ID}&LocationId=${locationId}`,
+      { headers: { Authorization: `Bearer ${authToken}` }, timeout: 3000 }
+    );
+    return res.data?.data || res.data;
+  } catch (error) {
+    return null;
+  }
 }
 
-async function findLinkedProfiles(guardianId, guardianLastName, locationId) {
+/**
+ * FAST SEARCH: Find linked profiles
+ * 1. Start from page 150 (most recent clients)
+ * 2. Search backward and forward from there
+ * 3. Stop early if we find results and have searched enough
+ */
+async function findLinkedProfiles(guardianId, locationId) {
   const linkedProfiles = [];
   const seenIds = new Set();
+  const authToken = await getToken();
 
   console.log(`PRODUCTION: Finding linked profiles for guardian: ${guardianId}`);
 
-  // Use CDC endpoint - it returns GuardianId directly (no need for individual detail calls)
-  // CDC is FAST because it includes all client fields in the response
-  const authToken = await getToken();
+  // Search in priority order: recent first, then older
+  const PAGE_RANGES = [
+    { start: 150, end: 200 },  // Most recent (page 150-200)
+    { start: 100, end: 150 },  // Recent (page 100-150)
+    { start: 50, end: 100 },   // Middle (page 50-100)
+    { start: 1, end: 50 }      // Oldest (page 1-50)
+  ];
 
-  // Start from beginning of current year to catch all recent linked profiles
-  const currentYear = new Date().getFullYear();
-  const startDate = `${currentYear}-01-01T00:00:00.000Z`;
+  for (const range of PAGE_RANGES) {
+    for (let batchStart = range.start; batchStart < range.end; batchStart += 10) {
+      const pagePromises = [];
 
-  console.log(`PRODUCTION: Searching CDC from ${startDate}`);
+      for (let page = batchStart; page < batchStart + 10 && page <= range.end; page++) {
+        pagePromises.push(
+          axios.get(
+            `${CONFIG.API_URL}/clients?tenantid=${CONFIG.TENANT_ID}&locationid=${locationId}&PageNumber=${page}&ItemsPerPage=100`,
+            { headers: { Authorization: `Bearer ${authToken}` }, timeout: 3000 }
+          ).catch(() => ({ data: { data: [] } }))
+        );
+      }
 
-  let page = 1;
-  const maxPages = 50;  // Safety limit
+      const results = await Promise.all(pagePromises);
+      let emptyPages = 0;
+      const candidateClients = [];
 
-  while (page <= maxPages) {
-    try {
-      const cdcRes = await axios.get(
-        `${CONFIG.API_URL}/cdc/entity/Client/changes?tenantid=${CONFIG.TENANT_ID}&locationid=${locationId}&StartDate=${startDate}&PageNumber=${page}&ItemsPerPage=100`,
-        { headers: { Authorization: `Bearer ${authToken}` }, timeout: 10000 }
-      );
+      for (const result of results) {
+        const clients = result.data?.data || [];
+        if (clients.length === 0) {
+          emptyPages++;
+          continue;
+        }
 
-      const records = cdcRes.data?.data || [];
-      if (records.length === 0) break;
-
-      for (const record of records) {
-        const client = record.Client_T;
-        if (!client) continue;
-
-        // Check if this client has our guardian as their guardian
-        if (client.GuardianId === guardianId && !seenIds.has(client.EntityId)) {
-          seenIds.add(client.EntityId);
-          linkedProfiles.push({
-            client_id: client.EntityId,
-            first_name: client.FirstName,
-            last_name: client.LastName,
-            name: `${client.FirstName} ${client.LastName}`,
-            is_minor: client.IsMinor || false,
-            type: client.IsMinor ? 'minor' : 'guest'
-          });
-          console.log(`PRODUCTION: Found linked profile via CDC: ${client.FirstName} ${client.LastName}`);
+        for (const c of clients) {
+          if (seenIds.has(c.clientId)) continue;
+          // Only check clients WITHOUT a phone (likely minors/dependents)
+          if (!c.primaryPhoneNumber) {
+            candidateClients.push(c);
+          }
         }
       }
 
-      page++;
-    } catch (e) {
-      console.log(`PRODUCTION: CDC error on page ${page}: ${e.message}`);
+      // Check candidates in parallel batches of 50
+      for (let i = 0; i < candidateClients.length; i += 50) {
+        const batch = candidateClients.slice(i, i + 50);
+        const detailPromises = batch.map(c =>
+          axios.get(
+            `${CONFIG.API_URL}/client/${c.clientId}?TenantId=${CONFIG.TENANT_ID}&LocationId=${locationId}`,
+            { headers: { Authorization: `Bearer ${authToken}` }, timeout: 2000 }
+          ).catch(() => null)
+        );
+
+        const detailResults = await Promise.all(detailPromises);
+
+        for (const detailRes of detailResults) {
+          if (!detailRes) continue;
+          const client = detailRes.data?.data || detailRes.data;
+          if (!client || seenIds.has(client.clientId)) continue;
+
+          seenIds.add(client.clientId);
+
+          if (client.guardianId === guardianId) {
+            linkedProfiles.push({
+              client_id: client.clientId,
+              first_name: client.firstName,
+              last_name: client.lastName,
+              name: `${client.firstName} ${client.lastName}`,
+              is_minor: client.isMinor || false,
+              type: client.isMinor ? 'minor' : 'guest'
+            });
+            console.log(`PRODUCTION: Found linked profile: ${client.firstName} ${client.lastName}`);
+          }
+        }
+      }
+
+      // If all pages empty, we've reached the end of this range
+      if (emptyPages >= 10) {
+        break;
+      }
+    }
+
+    // If we found linked profiles in recent pages, we can stop
+    // (linked profiles are usually created recently)
+    if (linkedProfiles.length > 0) {
+      console.log(`PRODUCTION: Found profiles in range ${range.start}-${range.end}, stopping search`);
       break;
     }
   }
 
-  console.log(`PRODUCTION: CDC search complete. Found ${linkedProfiles.length} linked profiles.`);
+  console.log(`PRODUCTION: Found ${linkedProfiles.length} linked profiles total`);
   return linkedProfiles;
 }
 
@@ -206,11 +244,7 @@ app.post('/get', async (req, res) => {
       });
     }
 
-    const linkedProfiles = await findLinkedProfiles(
-      callerId,
-      callerDetails.lastName,
-      locationId
-    );
+    const linkedProfiles = await findLinkedProfiles(callerId, locationId);
 
     const canBookFor = [
       `${callerDetails.firstName} (yourself)`
@@ -220,8 +254,6 @@ app.post('/get', async (req, res) => {
       const label = profile.is_minor ? 'child' : 'guest';
       canBookFor.push(`${profile.first_name} (${label})`);
     }
-
-    console.log(`PRODUCTION: Found ${linkedProfiles.length} linked profiles for ${callerDetails.firstName}`);
 
     res.json({
       success: true,
